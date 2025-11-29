@@ -1,360 +1,347 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
+
 import pandas as pd
 import numpy as np
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-import os
+import uvicorn
 import warnings
-from statsmodels.tools.sm_exceptions import ConvergenceWarning
-import logging
-import asyncio
 
-# Suppress noisy convergence warnings from statsmodels by default;
-# safe_fit will still detect them when needed.
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+from pmdarima import auto_arima   # <-- IMPORTANT: install pmdarima
+
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(level=logging.ERROR)
+# =========================================================
+# INITIALIZE APP
+# =========================================================
+app = FastAPI(
+    title="DCPO Crime Intelligence API",
+    description="Provides crime forecast, hotspots, and heatmap analytics",
+    version="1.0"
+)
 
-# ============================================================
-# Pydantic models (API response formats)
-# ============================================================
 
-class TotalForecastItem(BaseModel):
-    month: str          # e.g. "2026-01-01"
-    forecast_total: float
+# =========================================================
+# LOAD & CLEAN DATA (RUN ON IMPORT)
+# =========================================================
+
+# NOTE: palitan mo kung iba talaga file name mo
+DATA_PATH = "DCPO_Data.csv"     # <-- Your dataset here (dirty/raw)
+
+df_raw = pd.read_csv(DATA_PATH)
+
+# ---------- basic cleaning ----------
+df = df_raw.copy()
+df.columns = df.columns.str.upper().str.strip()
+
+required = ["BARANGAY", "CRIME_TYPE", "YEAR", "MONTH"]
+for col in required:
+    if col not in df.columns:
+        raise ValueError(f"Missing required column: {col}")
+
+# convert YEAR & MONTH
+df["YEAR"] = pd.to_numeric(df["YEAR"], errors="coerce")
+df["MONTH"] = pd.to_numeric(df["MONTH"], errors="coerce")
+df = df.dropna(subset=["YEAR", "MONTH"])
+
+df["YEAR"] = df["YEAR"].astype(int)
+df["MONTH"] = df["MONTH"].astype(int)
+
+# keep valid months
+df = df[(df["MONTH"] >= 1) & (df["MONTH"] <= 12)]
+
+# text fields
+df["CRIME_TYPE"] = df["CRIME_TYPE"].astype(str).str.upper().str.strip()
+df["BARANGAY"] = df["BARANGAY"].astype(str).str.strip()
+
+# date fields
+df["DATE"] = pd.to_datetime(dict(year=df["YEAR"], month=df["MONTH"], day=1))
+df = df.drop_duplicates().sort_values("DATE").reset_index(drop=True)
+
+# ---------- monthly aggregation ----------
+monthly = (
+    df.groupby(["DATE", "CRIME_TYPE"])
+      .size()
+      .reset_index(name="COUNT")
+)
+
+monthly_pivot = (
+    monthly.pivot(index="DATE", columns="CRIME_TYPE", values="COUNT")
+           .fillna(0)
+           .sort_index()
+)
+
+# ensure walang skip na buwan
+full_idx = pd.date_range(
+    start=monthly_pivot.index.min(),
+    end=monthly_pivot.index.max(),
+    freq="MS"
+)
+monthly_pivot = monthly_pivot.reindex(full_idx).fillna(0)
+monthly_pivot.index.name = "DATE"
+
+# total crimes per month
+total_monthly = monthly_pivot.sum(axis=1).to_frame(name="TOTAL_CRIMES")
+
+
+# =========================================================
+# RESPONSE MODELS
+# =========================================================
+
+class ForecastItem(BaseModel):
+    date: str          # YYYY-MM
+    crime_type: str
+    forecast: float
     lower_ci: float
     upper_ci: float
 
-class TotalForecastResponse(BaseModel):
+class ForecastResponse(BaseModel):
     status: str
     horizon: int
-    data: List[TotalForecastItem]
+    results: List[ForecastItem]
 
-class TopCrimeItem(BaseModel):
-    month: str
-    top_offense: str
-    top_value: float
+class HotspotItem(BaseModel):
+    barangay: str
+    total_crime: int
 
-class TopCrimeResponse(BaseModel):
+class HotspotResponse(BaseModel):
     status: str
-    horizon: int
-    data: List[TopCrimeItem]
+    top_n: int
+    results: List[HotspotItem]
 
-# ============================================================
-# FastAPI App
-# ============================================================
-
-app = FastAPI(
-    title="DCPO SARIMA Crime Forecast API",
-    description=(
-        "Uses optimized SARIMA model on DCPO_5years_monthly.csv to forecast:\n"
-        "- total monthly crimes\n"
-        "- top crime type per future month\n"
-        "Dataset includes both crime and cybercrime complaints."
-    ),
-    version="2.0.0",
-)
-
-# ============================================================
-# GLOBALS (loaded at startup)
-# ============================================================
-
-df_dcpo: pd.DataFrame | None = None         # cleaned raw data
-ts_total: pd.Series | None = None           # total crimes per month
-monthly_offense: pd.DataFrame | None = None # crimes per offense per month
-model_total_full: SARIMAX | None = None     # fitted SARIMA for total
-offense_models: dict[str, SARIMAX] = {}     # fitted SARIMA per offense
-
-# Chosen best SARIMA order from your optimization
-BEST_ORDER = (1, 1, 1)
-BEST_SEASONAL_ORDER = (0, 1, 1, 12)
+class HeatmapResponse(BaseModel):
+    status: str
+    matrix: Dict[str, Dict[str, int]]  # {barangay: {crime: count}}
 
 
-# ============================================================
-# Helper: load CSV, clean, build series, train models
-# ============================================================
+# =========================================================
+# SARIMA HELPER (same style as sa Colab mo)
+# =========================================================
 
-def load_and_train() -> None:
-    """Load DCPO data, clean it, build monthly series, train SARIMA models."""
-    global df_dcpo, ts_total, monthly_offense, model_total_full, offense_models
+def run_sarima(series: pd.Series, horizon: int = 12) -> List[Dict]:
+    """
+    SARIMA forecast with:
+    - monthly frequency (MS)
+    - auto_arima to select (p,d,q)(P,D,Q,12) with D=1
+    - linear trend "t"
+    """
+    s = series.asfreq("MS").fillna(0)
 
-    # ---------- 1. Load CSV ----------
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(base_dir, "..", "data", "DCPO_5years_monthly.csv")
-    csv_path = os.path.abspath(csv_path)
+    # kung sobrang konti data, huwag na i-forecast
+    if len(s) < 10 or s.sum() < 5:
+        return []
 
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"DCPO_5years_monthly.csv not found at: {csv_path}")
+    try:
+        auto = auto_arima(
+            s,
+            start_p=0, start_q=0,
+            max_p=3, max_q=3,
+            start_P=0, start_Q=0,
+            max_P=2, max_Q=2,
+            m=12,               # monthly seasonality
+            seasonal=True,
+            d=None,
+            D=1,                # force seasonal differencing
+            trace=False,
+            error_action="ignore",
+            suppress_warnings=True,
+            stepwise=True,
+        )
+        order = auto.order
+        seasonal_order = auto.seasonal_order
+    except Exception:
+        # fallback simple model kung mag-fail auto_arima
+        order = (1, 0, 0)
+        seasonal_order = (1, 1, 0, 12)
 
-    df = pd.read_csv(csv_path)
-
-    # Expect columns: gu, Date, offense, Count
-    required_cols = {"Date", "offense", "Count"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV is missing required columns: {missing}")
-
-    # ---------- 2. Basic Cleaning ----------
-    # Parse dates
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"])
-    df = df.sort_values("Date")
-
-    # Normalize offense labels (upper-case, trim spaces)
-    df["offense"] = df["offense"].astype(str).str.upper().str.strip()
-
-    # Ensure Count is numeric
-    df["Count"] = pd.to_numeric(df["Count"], errors="coerce").fillna(0)
-
-    # Keep a clean copy
-    df_dcpo = df.copy()
-
-    # Month index (period → timestamp at month start)
-    df["month"] = df["Date"].dt.to_period("M").dt.to_timestamp()
-
-    # ---------- 3. Build monthly TOTAL series ----------
-    monthly_total = (
-        df.groupby("month")["Count"]
-          .sum()
-          .rename("count")
-          .to_frame()
-    )
-
-    ts = monthly_total["count"].astype(float)
-    ts = ts.asfreq("MS").fillna(0)   # ensure monthly frequency
-
-    ts_total = ts
-
-    # ---------- 4. Build monthly OFFENSE matrix ----------
-    monthly_off = (
-        df.groupby(["month", "offense"])["Count"]
-          .sum()
-          .unstack(fill_value=0)
-    )
-    monthly_off = monthly_off.asfreq("MS").fillna(0)
-    monthly_offense = monthly_off
-
-    model = SARIMAX(
-        ts_total,
-        order=BEST_ORDER,
-        seasonal_order=BEST_SEASONAL_ORDER,
-        enforce_stationarity=False,
-        enforce_invertibility=False,
-    )
-    # Use a robust fit wrapper that retries with alternative optimizers
-    def safe_fit(smodel):
-        """Fit `smodel`, detect ConvergenceWarning without raising it, and retry.
-
-        Strategy:
-        - Run a normal fit under a local warnings capture that records any
-          ConvergenceWarning instances (so global suppression doesn't hide them).
-        - If a ConvergenceWarning was recorded, retry with alternative optimizers
-          (`powell`, then `nm`). Log only INFO-level messages so the terminal
-          isn't flooded with repeated WARNING lines.
-
-        Returns the fitted results object.
-        """
-        # Attempt 1: run normally but capture any ConvergenceWarning instances
-        try:
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always", ConvergenceWarning)
-                res = smodel.fit(disp=False, method="lbfgs", maxiter=1000)
-
-                # Check if any recorded warnings are ConvergenceWarning
-                conv_warns = [x for x in w if issubclass(x.category, ConvergenceWarning)]
-
-            if not conv_warns:
-                return res
-            # Otherwise, log and fall through to retries
-            logger.debug("lbfgs produced ConvergenceWarning; retrying with 'powell' (more robust).")
-        except Exception as e:
-            # If the fit raised an exception (not just a convergence warning), log and retry
-            logger.info("Fit attempt (lbfgs) raised an exception; retrying: %s", e)
-
-        # Retry 1: powell
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=ConvergenceWarning)
-                res = smodel.fit(disp=False, method="powell", maxiter=2000)
-            return res
-        except Exception as e:
-            logger.info("Retry (powell) failed: %s", e)
-
-        # Retry 2: Nelder-Mead
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=ConvergenceWarning)
-                res = smodel.fit(disp=False, method="nm", maxiter=2000)
-            return res
-        except Exception as e:
-            logger.info("Retry (nm) failed: %s", e)
-
-        # Final fallback: default fit (suppress convergence warnings)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=ConvergenceWarning)
-            res = smodel.fit(disp=False)
-        return res
-
-    model_total_full = safe_fit(model)
-    logger.debug("DCPO TOTAL SARIMA model trained.")
-    offense_models.clear()
-    for off in monthly_offense.columns:
-        series_off = monthly_offense[off].astype(float)
-
-        # skip if masyadong konti ang data
-        if series_off.sum() == 0 or series_off.notna().sum() < 24:
-            continue
-
-        off_model = SARIMAX(
-            series_off,
-            order=BEST_ORDER,
-            seasonal_order=BEST_SEASONAL_ORDER,
+    try:
+        model = SARIMAX(
+            s,
+            order=order,
+            seasonal_order=seasonal_order,
+            trend="t",
             enforce_stationarity=False,
-            enforce_invertibility=False,
+            enforce_invertibility=False
         )
-        try:
-            off_fit = safe_fit(off_model)
-            offense_models[off] = off_fit
-        except Exception as e:
-            logger.error("Failed to fit offense model '%s': %s", off, e)
+        result = model.fit(disp=False)
+    except Exception:
+        return []
 
-    logger.debug("DCPO SARIMA models trained.")
-    logger.debug("  • Months in series: %s", len(ts_total))
-    logger.debug("  • Offense models : %s", len(offense_models))
+    forecast = result.get_forecast(steps=horizon)
+    mean = forecast.predicted_mean.clip(lower=0)
+    ci = forecast.conf_int().clip(lower=0)
 
+    output = []
+    for i in range(len(mean)):
+        output.append({
+            "date": mean.index[i].strftime("%Y-%m"),
+            "forecast": float(mean.iloc[i]),
+            "lower_ci": float(ci.iloc[i, 0]),
+            "upper_ci": float(ci.iloc[i, 1]),
+        })
 
-# ============================================================
-# Startup event: train once when server starts
-# ============================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """Schedule training in a background thread so startup doesn't block the event loop.
-
-    This prevents long-running synchronous fits from causing CancelledError tracebacks
-    when the server (re)loader shuts down or restarts.
-    """
-    async def _run_training():
-        try:
-            await asyncio.to_thread(load_and_train)
-        except asyncio.CancelledError:
-            logger.error("Startup training task was cancelled.")
-        except Exception as exc:
-            logger.error("Error during startup training: %s", exc)
-
-    # Launch background training task and don't await it here.
-    asyncio.create_task(_run_training())
+    return output
 
 
-# ============================================================
-# ROUTES
-# ============================================================
+# =========================================================
+# ====================== API ROUTES =======================
+# =========================================================
 
-@app.get("/", tags=["health"])
-def health_check():
-    return {"status": "ok", "message": "DCPO SARIMA API is running."}
+# -----------------------------------------
+# 🔥 1. GET HOTSPOTS (Top barangays)
+# -----------------------------------------
+@app.get("/hotspots", response_model=HotspotResponse)
+def get_hotspots(top_n: int = 20):
 
-
-@app.get("/total-forecast", response_model=TotalForecastResponse, tags=["forecast"])
-def total_forecast(horizon: int = 12):
-    """
-    Forecast TOTAL crime (all offenses, all barangays) for the next N months.
-
-    - horizon: 1–60 months (default 12)
-    """
-    global ts_total, model_total_full
-
-    if ts_total is None or model_total_full is None:
-        raise HTTPException(status_code=500, detail="Model not trained.")
-
-    if horizon <= 0 or horizon > 60:
-        raise HTTPException(status_code=400, detail="horizon must be between 1 and 60")
-
-    fc = model_total_full.get_forecast(steps=horizon)
-    mean = fc.predicted_mean
-    ci = fc.conf_int()
-
-    future_months = pd.date_range(
-        start=ts_total.index[-1] + pd.offsets.MonthBegin(1),
-        periods=horizon,
-        freq="MS",
+    totals = (
+        df.groupby("BARANGAY")
+          .size()
+          .reset_index(name="TOTAL")
+          .sort_values("TOTAL", ascending=False)
     )
 
-    items: List[TotalForecastItem] = []
-    for i in range(horizon):
-        items.append(
-            TotalForecastItem(
-                month=str(future_months[i].date()),
-                forecast_total=float(mean.iloc[i]),
-                lower_ci=float(ci.iloc[i, 0]),
-                upper_ci=float(ci.iloc[i, 1]),
-            )
-        )
+    results = [
+        HotspotItem(barangay=row["BARANGAY"], total_crime=int(row["TOTAL"]))
+        for _, row in totals.head(top_n).iterrows()
+    ]
 
-    return TotalForecastResponse(
+    return HotspotResponse(
+        status="success",
+        top_n=top_n,
+        results=results
+    )
+
+
+# -----------------------------------------
+# 🔥 2. FORECAST PER CRIME TYPE
+# -----------------------------------------
+@app.get("/forecast/{crime_type}", response_model=ForecastResponse)
+def get_forecast(crime_type: str, horizon: int = 12):
+
+    crime_type = crime_type.upper()
+    if crime_type not in monthly_pivot.columns:
+        raise HTTPException(404, detail="Crime type not found.")
+
+    series = monthly_pivot[crime_type]
+    sarima_output = run_sarima(series, horizon)
+
+    if not sarima_output:
+        raise HTTPException(500, detail="SARIMA model failed or too little data.")
+
+    results = [
+        ForecastItem(
+            date=item["date"],
+            crime_type=crime_type,
+            forecast=item["forecast"],
+            lower_ci=item["lower_ci"],
+            upper_ci=item["upper_ci"],
+        )
+        for item in sarima_output
+    ]
+
+    return ForecastResponse(
         status="success",
         horizon=horizon,
-        data=items,
+        results=results
     )
 
 
-@app.get("/offense-list", tags=["offense"])
-def offense_list():
-    """Listahan ng offenses na may SARIMA model."""
-    if not offense_models:
-        raise HTTPException(status_code=500, detail="Offense models not trained.")
-    return {"status": "success", "offenses": sorted(offense_models.keys())}
+# -----------------------------------------
+# 🔥 2B. FORECAST TOTAL CRIMES (All types)
+# -----------------------------------------
+@app.get("/forecast-total", response_model=ForecastResponse)
+def get_forecast_total(horizon: int = 12):
 
+    series = total_monthly["TOTAL_CRIMES"]
+    sarima_output = run_sarima(series, horizon)
 
-@app.get("/top-crime", response_model=TopCrimeResponse, tags=["forecast"])
-def top_crime(horizon: int = 12):
-    """
-    For each future month, predict which offense will have the HIGHEST count.
+    if not sarima_output:
+        raise HTTPException(500, detail="SARIMA model failed.")
 
-    - horizon: 1–60 months (default 12)
-    """
-    global ts_total, offense_models
-
-    if ts_total is None or not offense_models:
-        raise HTTPException(status_code=500, detail="Models not trained.")
-
-    if horizon <= 0 or horizon > 60:
-        raise HTTPException(status_code=400, detail="horizon must be between 1 and 60")
-
-    future_months = pd.date_range(
-        start=ts_total.index[-1] + pd.offsets.MonthBegin(1),
-        periods=horizon,
-        freq="MS",
-    )
-
-    # Forecast per offense
-    offense_fc: Dict[str, np.ndarray] = {}
-    for off, model in offense_models.items():
-        fc = model.get_forecast(steps=horizon)
-        offense_fc[off] = fc.predicted_mean.values
-
-    rows: List[TopCrimeItem] = []
-    for i in range(horizon):
-        # scores for this step
-        step_scores = {off: float(vals[i]) for off, vals in offense_fc.items()}
-
-        # pick offense with highest forecast
-        top_off = max(step_scores, key=step_scores.get)
-        top_val = step_scores[top_off]
-
-        rows.append(
-            TopCrimeItem(
-                month=str(future_months[i].date()),
-                top_offense=top_off,
-                top_value=top_val,
-            )
+    results = [
+        ForecastItem(
+            date=item["date"],
+            crime_type="TOTAL_CRIMES",
+            forecast=item["forecast"],
+            lower_ci=item["lower_ci"],
+            upper_ci=item["upper_ci"],
         )
+        for item in sarima_output
+    ]
 
-    return TopCrimeResponse(
+    return ForecastResponse(
         status="success",
         horizon=horizon,
-        data=rows,
+        results=results
     )
+
+
+# -----------------------------------------
+# 🔥 3. TOP CRIME PER MONTH (Historical)
+# -----------------------------------------
+@app.get("/top-crimes")
+def get_top_crimes():
+
+    top = (
+        monthly.sort_values(["DATE", "COUNT"], ascending=[True, False])
+               .groupby("DATE")
+               .head(1)
+               .reset_index(drop=True)
+    )
+
+    output = []
+    for _, row in top.iterrows():
+        output.append({
+            "date": row["DATE"].strftime("%Y-%m"),
+            "crime_type": row["CRIME_TYPE"],
+            "count": int(row["COUNT"])
+        })
+
+    return {"status": "success", "results": output}
+
+
+# -----------------------------------------
+# 🔥 4. HEATMAP DATA (Barangay × Crime Type)
+# -----------------------------------------
+@app.get("/heatmap", response_model=HeatmapResponse)
+def get_heatmap():
+
+    matrix = (
+        df.groupby(["BARANGAY", "CRIME_TYPE"])
+          .size()
+          .reset_index(name="COUNT")
+    )
+
+    pivot = (
+        matrix.pivot(index="BARANGAY", columns="CRIME_TYPE", values="COUNT")
+              .fillna(0)
+              .astype(int)
+    )
+
+    # {barangay: {crime: count}}
+    heatmap_dict = pivot.to_dict(orient="index")
+
+    return HeatmapResponse(
+        status="success",
+        matrix=heatmap_dict
+    )
+
+
+# -----------------------------------------
+# ROOT
+# -----------------------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "message": "DCPO Crime Intelligence API is active."
+    }
+
+
+# =========================================================
+# RUN SERVER (for local dev)
+# =========================================================
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
