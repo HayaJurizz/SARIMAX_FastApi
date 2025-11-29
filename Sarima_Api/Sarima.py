@@ -28,7 +28,7 @@ app = FastAPI(
 # =========================================================
 
 # NOTE: palitan mo kung iba talaga file name mo
-DATA_PATH = "DCPO_Data.csv"     # <-- Your dataset here (dirty/raw)
+DATA_PATH = "../data/DCPO_Data.csv"     # <-- Your dataset here (dirty/raw)
 
 df_raw = pd.read_csv(DATA_PATH)
 
